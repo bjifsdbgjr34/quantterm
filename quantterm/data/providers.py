@@ -66,7 +66,9 @@ class Result:
     source: str  # 'yahoo' | 'fred' | 'demo'
 
 
-PROBES = {"yahoo": "https://query1.finance.yahoo.com/", "fred": "https://fred.stlouisfed.org/"}
+# FRED's homepage can stall for non-browser clients; the CSV endpoint the app actually uses answers fast.
+PROBES = {"yahoo": "https://query1.finance.yahoo.com/",
+          "fred": "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10&cosd=2026-01-01"}
 _online_cache: dict[str, tuple[float, bool]] = {}
 
 
@@ -78,7 +80,9 @@ def online(name: str) -> bool:
     import httpx
 
     try:
-        httpx.get(PROBES[name], timeout=4, headers={"User-Agent": "Mozilla/5.0"})
+        # FRED stalls requests with a fake browser User-Agent; Yahoo wants one
+        ua = "quantterm/1.0" if name == "fred" else "Mozilla/5.0"
+        httpx.get(PROBES[name], timeout=10, follow_redirects=True, headers={"User-Agent": ua})
         ok = True
     except Exception:  # noqa: BLE001
         ok = False
@@ -88,15 +92,23 @@ def online(name: str) -> bool:
     return ok
 
 
-def _with_fallback(name: str, live: Callable[[], Any], demo: Callable[[], Any]) -> Result:
+def _with_fallback(name: str, live: Callable[[], Any], demo: Callable[[], Any], retries: int = 1) -> Result:
     if config.DATA_MODE == "demo" or (config.DATA_MODE == "auto" and not online(name)):
         return Result(demo(), "demo")
-    try:
-        data = live()
-    except DataError:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        raise DataError(f"{name}: {exc}") from exc
+    for attempt in range(retries + 1):
+        try:
+            data = live()
+            break
+        except Exception as exc:  # noqa: BLE001
+            # Yahoo intermittently answers 401 "Invalid Crumb" or an empty payload under concurrent load;
+            # one short retry fixes almost all of these. Genuine "no data" errors simply fail twice.
+            if attempt < retries:
+                log.info("%s call failed (%s), retrying", name, exc)
+                time.sleep(0.8 * (attempt + 1))
+                continue
+            if isinstance(exc, DataError):
+                raise
+            raise DataError(f"{name}: {exc}") from exc
     if data is None or (hasattr(data, "empty") and data.empty):
         raise DataError(f"{name}: empty response")
     return Result(data, name)
@@ -255,6 +267,27 @@ def _demo_history(symbol: str, start: date, end: date, interval: str = "1d") -> 
 # --------------------------------------------------------------------------------------
 # Yahoo
 # --------------------------------------------------------------------------------------
+# yfinance shares one cookie/crumb session. A 401/404 on one call makes it refresh the crumb, and calls in
+# flight at that moment come back empty ("Available expirations are: []"). Serialise the crumb-sensitive
+# endpoints (options, earnings) so they never race with each other.
+_YF_LOCK = threading.RLock()
+
+NON_EQUITY_SECTORS = ("ETF", "Index", "FX", "Commodity", "Crypto", "Rates")
+
+
+def is_single_stock(sym: str) -> bool:
+    """Cheap check (no network) used to avoid asking Yahoo for earnings/fundamentals it doesn't have."""
+    s = norm(sym)
+    if s.startswith("^") or "=" in s or s.endswith("-USD") or s in MONITORS.get("SECTORS", []):
+        return False
+    return (DEMO_META.get(s, (None, "Equity"))[1] not in NON_EQUITY_SECTORS) and s not in ETF_HINTS
+
+
+ETF_HINTS = {"SPY", "QQQ", "IWM", "DIA", "TLT", "IEF", "SHY", "GLD", "SLV", "USO", "UNG", "DBC", "VNQ", "EFA", "EEM",
+             "VTI", "VOO", "VEA", "VWO", "AGG", "BND", "LQD", "HYG", "IWD", "IWF", "MTUM", "QUAL", "USMV", "XLK", "XLF",
+             "XLV", "XLE", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE", "XLC", "SMH", "ARKK", "GDX", "TQQQ", "SQQQ"}
+
+
 def _yf():
     import yfinance as yf  # imported lazily: slow import, optional in demo mode
 
@@ -388,10 +421,39 @@ def info(symbol: str) -> Result:
     sym = norm(symbol)
 
     def live():
-        raw = _yf().Ticker(sym).info or {}
-        if not raw or len(raw) < 3:
+        # Yahoo's quoteSummary intermittently returns a near-empty payload when its cookie/crumb
+        # handshake fails; retry once, then fall back to the lighter fast_info endpoint.
+        t = _yf().Ticker(sym)
+        raw: dict = {}
+        out: dict = {}
+        for attempt in range(3):
+            try:
+                raw = t.info or {}
+            except Exception as e:  # noqa: BLE001
+                log.warning("info(%s) attempt %d failed: %s", sym, attempt + 1, e)
+                raw = {}
+            cand = {k: raw.get(k) for k in INFO_FIELDS if raw.get(k) is not None}
+            if len(cand) > len(out):
+                out = cand
+            if len(out) >= 25 or raw.get("quoteType") not in (None, "EQUITY"):  # ETFs/indices legitimately have fewer
+                break
+            time.sleep(0.6)
+        if len(out) < 5:
+            try:
+                fi = t.fast_info
+                for key, field in (("marketCap", "market_cap"), ("currency", "currency"), ("exchange", "exchange"),
+                                   ("quoteType", "quote_type"), ("fiftyTwoWeekHigh", "year_high"),
+                                   ("fiftyTwoWeekLow", "year_low"), ("fiftyDayAverage", "fifty_day_average"),
+                                   ("twoHundredDayAverage", "two_hundred_day_average"), ("sharesOutstanding", "shares")):
+                    v = fi.get(field)
+                    if v is not None:
+                        out.setdefault(key, v)
+                out["_partial"] = True  # UI can say fundamentals were unavailable
+            except Exception:  # noqa: BLE001
+                pass
+        if not out:
             raise DataError(f"No reference data for {sym}")
-        return {k: raw.get(k) for k in INFO_FIELDS if raw.get(k) is not None} | {"symbol": sym}
+        return out | {"symbol": sym}
 
     def demo():
         name, sector, industry, px, vol = _demo_meta(sym)
@@ -412,10 +474,19 @@ def info(symbol: str) -> Result:
     return _with_fallback("yahoo", live, demo)
 
 
+KEY_ROWS = ["Total Revenue", "Gross Profit", "Operating Income", "EBITDA", "Net Income", "Diluted EPS",
+            "Total Assets", "Total Liabilities Net Minority Interest", "Stockholders Equity", "Cash And Cash Equivalents",
+            "Total Debt", "Net Debt", "Operating Cash Flow", "Capital Expenditure", "Free Cash Flow",
+            "Repurchase Of Capital Stock", "Cash Dividends Paid"]
+
+
 def _df_to_records(df: pd.DataFrame) -> dict:
     if df is None or df.empty:
         return {"columns": [], "rows": []}
     df = df.copy()
+    # headline lines first (yfinance >= 1.x returns rows in an arbitrary order), then the rest as delivered
+    first = [r for r in KEY_ROWS if r in df.index]
+    df = df.loc[first + [r for r in df.index if r not in first]]
     df.columns = [c.strftime("%Y-%m-%d") if hasattr(c, "strftime") else str(c) for c in df.columns]
     rows = []
     for idx, r in df.iterrows():
@@ -485,7 +556,8 @@ def option_expiries(symbol: str) -> Result:
     sym = norm(symbol)
 
     def live():
-        exps = list(_yf().Ticker(sym).options)
+        with _YF_LOCK:
+            exps = list(_yf().Ticker(sym).options)
         if not exps:
             raise DataError(f"No listed options for {sym}")
         return exps
@@ -506,7 +578,7 @@ def option_expiries(symbol: str) -> Result:
                 out.append(third_fri.isoformat())
         return sorted(out)
 
-    return _with_fallback("yahoo", live, demo)
+    return _with_fallback("yahoo", live, demo, retries=2)
 
 
 @cached(ttl=120)
@@ -515,7 +587,8 @@ def option_chain(symbol: str, expiry: str) -> Result:
     cols = ["contractSymbol", "strike", "lastPrice", "bid", "ask", "volume", "openInterest", "impliedVolatility", "inTheMoney"]
 
     def live():
-        ch = _yf().Ticker(sym).option_chain(expiry)
+        with _YF_LOCK:
+            ch = _yf().Ticker(sym).option_chain(expiry)
         calls, puts = ch.calls[cols].copy(), ch.puts[cols].copy()
         if calls.empty and puts.empty:
             raise DataError("empty chain")
@@ -527,7 +600,7 @@ def option_chain(symbol: str, expiry: str) -> Result:
         spot = float(_demo_history(sym, period_start("1mo"), date.today())["Close"].iloc[-1])
         atm_vol = _demo_meta(sym)[4]
         T = max((date.fromisoformat(expiry) - date.today()).days, 1) / 365
-        step = 10 ** math.floor(math.log10(spot)) / (4 if spot / 10 ** math.floor(math.log10(spot)) < 3 else 2)
+        step = min([0.5, 1, 2.5, 5, 10, 25, 50, 100, 250, 500, 1000], key=lambda x: abs(math.log(x / (spot * 0.0125))))
         strikes = np.arange(math.floor(spot * 0.7 / step) * step, spot * 1.3 + step, step)
         rng = np.random.default_rng(_seed(sym + expiry))
         frames = {}
@@ -546,7 +619,7 @@ def option_chain(symbol: str, expiry: str) -> Result:
             frames[kind + "s"] = pd.DataFrame(rows)
         return frames
 
-    return _with_fallback("yahoo", live, demo)
+    return _with_fallback("yahoo", live, demo, retries=2)
 
 
 # --------------------------------------------------------------------------------------
@@ -660,3 +733,265 @@ def search(query: str) -> Result:
                 if qu in s or qu in m[0].upper()][:10]
 
     return _with_fallback("yahoo", live, demo)
+
+
+# --------------------------------------------------------------------------------------
+# screener / heatmap universe (S&P 500 large caps by sector; extend freely)
+# --------------------------------------------------------------------------------------
+UNIVERSE = {
+    "Technology": ["AAPL", "MSFT", "NVDA", "AVGO", "ORCL", "CRM", "AMD", "ADBE", "CSCO", "ACN", "IBM", "INTU", "QCOM", "TXN", "AMAT", "MU", "NOW", "PANW"],
+    "Communication Services": ["GOOGL", "META", "NFLX", "DIS", "TMUS", "VZ", "T", "CMCSA"],
+    "Consumer Cyclical": ["AMZN", "TSLA", "HD", "MCD", "NKE", "LOW", "SBUX", "BKNG", "TJX", "CMG"],
+    "Consumer Defensive": ["WMT", "PG", "COST", "KO", "PEP", "PM", "MDLZ", "CL", "MO"],
+    "Financial Services": ["JPM", "V", "MA", "BAC", "WFC", "GS", "MS", "AXP", "BLK", "SCHW", "C", "SPGI"],
+    "Healthcare": ["LLY", "UNH", "JNJ", "ABBV", "MRK", "TMO", "ABT", "PFE", "AMGN", "ISRG", "DHR", "GILD"],
+    "Industrials": ["CAT", "GE", "HON", "UNP", "RTX", "BA", "DE", "LMT", "UPS", "ETN"],
+    "Energy": ["XOM", "CVX", "COP", "SLB", "EOG", "PSX", "MPC"],
+    "Utilities": ["NEE", "SO", "DUK", "AEP"],
+    "Real Estate": ["PLD", "AMT", "EQIX", "SPG"],
+    "Basic Materials": ["LIN", "SHW", "FCX", "NEM", "APD"],
+}
+UNIVERSE_SECTOR = {s: sec for sec, syms in UNIVERSE.items() for s in syms}
+
+
+def universe(name: str = "SPX100") -> list[str]:
+    if name.upper() in MONITORS:
+        return MONITORS[name.upper()]
+    return [s for syms in UNIVERSE.values() for s in syms]
+
+
+def _demo_info_for(sym: str) -> dict:
+    """Deterministic demo fundamentals that respect the universe's sector map."""
+    rng = np.random.default_rng(_seed(sym) + 7)
+    sector = UNIVERSE_SECTOR.get(sym) or _demo_meta(sym)[1]
+    px = _demo_meta(sym)[3]
+    return {"symbol": sym, "longName": _demo_meta(sym)[0] if sym in DEMO_META else f"{sym} (demo)", "sector": sector,
+            "marketCap": px * float(rng.uniform(0.3e9, 8e9)), "trailingPE": float(rng.uniform(8, 60)),
+            "forwardPE": float(rng.uniform(7, 45)), "priceToBook": float(rng.uniform(0.8, 20)),
+            "dividendYield": float(rng.uniform(0, 4)), "profitMargins": float(rng.uniform(-0.05, 0.4)),
+            "returnOnEquity": float(rng.uniform(-0.05, 0.6)), "revenueGrowth": float(rng.uniform(-0.1, 0.4))}
+
+
+@cached(ttl=6 * 3600)
+def bulk_info(symbols: tuple[str, ...]) -> Result:
+    """Reference/fundamental data for many symbols (threaded; failures are skipped, not fatal)."""
+    syms = [norm(s) for s in symbols]
+
+    def live():
+        from concurrent.futures import ThreadPoolExecutor
+
+        def one(s):
+            try:
+                return s, info(s).data
+            except Exception:  # noqa: BLE001
+                return s, None
+
+        with ThreadPoolExecutor(max_workers=4) as ex:  # more threads trigger Yahoo crumb errors
+            out = {s: d for s, d in ex.map(one, syms) if d}
+        if not out:
+            raise DataError("no fundamentals returned")
+        for s, d in out.items():
+            d.setdefault("sector", UNIVERSE_SECTOR.get(s))
+        return out
+
+    return _with_fallback("yahoo", live, lambda: {s: _demo_info_for(s) for s in syms})
+
+
+# --------------------------------------------------------------------------------------
+# intraday bars and streaming quotes
+# --------------------------------------------------------------------------------------
+def _demo_intraday(sym: str, interval: str = "5m", days: int = 1) -> pd.DataFrame:
+    """Synthetic intraday bars ending now, anchored to the demo daily close. Changes every bar."""
+    step = {"1m": 1, "2m": 2, "5m": 5, "15m": 15, "30m": 30, "60m": 60}.get(interval, 5)
+    daily = _demo_history(sym, period_start("1mo"), date.today())
+    prev_close = float(daily["Close"].iloc[-2]) if len(daily) > 1 else float(daily["Close"].iloc[-1])
+    vol = _demo_meta(sym)[4]
+    now = pd.Timestamp.now().floor(f"{step}min")
+    idx = pd.date_range(end=now, periods=max(int(days * 390 / step), 10), freq=f"{step}min")
+    rng = np.random.default_rng(_seed(sym) + int(now.normalize().value // 10**9))
+    sig = vol / math.sqrt(252 * 390 / step)
+    path = prev_close * np.exp(np.cumsum(rng.standard_normal(len(idx)) * sig))
+    hi = path * (1 + np.abs(rng.standard_normal(len(idx))) * sig * 0.5)
+    lo = path * (1 - np.abs(rng.standard_normal(len(idx))) * sig * 0.5)
+    op_ = np.r_[prev_close, path[:-1]]
+    vol_ = np.abs(rng.standard_normal(len(idx))) * 5e4
+    return pd.DataFrame({"Open": op_, "High": np.maximum(hi, np.maximum(op_, path)), "Low": np.minimum(lo, np.minimum(op_, path)),
+                         "Close": path, "Volume": vol_}, index=idx)
+
+
+@cached(ttl=30)
+def intraday(symbol: str, interval: str = "5m", days: int = 1) -> Result:
+    sym = norm(symbol)
+    period = {1: "1d", 5: "5d"}.get(days, "5d")
+
+    def live():
+        df = _yf().Ticker(sym).history(period=period, interval=interval, prepost=False, auto_adjust=True)
+        df = _clean_hist(df)
+        if df.empty:
+            raise DataError(f"No intraday data for {sym} (market closed or unsupported)")
+        return df
+
+    return _with_fallback("yahoo", live, lambda: _demo_intraday(sym, interval, days))
+
+
+@cached(ttl=4)
+def live_quotes(symbols: tuple[str, ...]) -> Result:
+    """Near-real-time last price (Yahoo's free feed is delayed ~15 min for some exchanges)."""
+    syms = [norm(s) for s in symbols]
+
+    def live():
+        yf = _yf()
+        out = []
+        for s in syms:
+            try:
+                fi = yf.Ticker(s).fast_info
+                last, prev = fi.get("lastPrice") or fi.get("last_price"), fi.get("previousClose") or fi.get("previous_close")
+                if last is None:
+                    continue
+                out.append({"symbol": s, "last": float(last), "prev": float(prev) if prev else None,
+                            "pct": (float(last) / float(prev) - 1) * 100 if prev else None,
+                            "time": datetime.now().isoformat(timespec="seconds")})
+            except Exception:  # noqa: BLE001
+                continue
+        if not out:
+            raise DataError("no live quotes")
+        return out
+
+    def demo():
+        out = []
+        for s in syms:
+            bars = _demo_intraday(s, "1m", 1)
+            prev = float(bars["Open"].iloc[0])
+            # jitter within the current minute so the stream visibly ticks
+            jit = 1 + np.random.default_rng(int(time.time()) + _seed(s)).standard_normal() * _demo_meta(s)[4] / math.sqrt(252 * 390 * 60) * 4
+            last = float(bars["Close"].iloc[-1]) * jit
+            out.append({"symbol": s, "last": last, "prev": prev, "pct": (last / prev - 1) * 100,
+                        "time": datetime.now().isoformat(timespec="seconds")})
+        return out
+
+    return _with_fallback("yahoo", live, demo)
+
+
+# --------------------------------------------------------------------------------------
+# events: earnings and macro calendar
+# --------------------------------------------------------------------------------------
+@cached(ttl=6 * 3600)
+def earnings_date(symbol: str) -> Result:
+    """Next (and recent) earnings dates with EPS estimate / actual where available."""
+    sym = norm(symbol)
+
+    if not is_single_stock(sym):
+        raise DataError(f"{sym} has no earnings (not a single stock)")
+
+    def live():
+        t = _yf().Ticker(sym)
+        rows = []
+        try:
+            with _YF_LOCK:
+                ed = t.get_earnings_dates(limit=12)
+            if ed is not None and not ed.empty:
+                for ts_, r in ed.iterrows():
+                    d = pd.Timestamp(ts_)
+                    if d.tzinfo is not None:
+                        d = d.tz_convert(None)
+                    rows.append({"date": d.strftime("%Y-%m-%d"), "eps_est": r.get("EPS Estimate"),
+                                 "eps_act": r.get("Reported EPS"), "surprise_pct": r.get("Surprise(%)")})
+        except Exception:  # noqa: BLE001
+            pass
+        if not rows:
+            cal = t.calendar or {}
+            dates = cal.get("Earnings Date") if isinstance(cal, dict) else None
+            for d in dates or []:
+                rows.append({"date": pd.Timestamp(d).strftime("%Y-%m-%d"), "eps_est": cal.get("Earnings Average"),
+                             "eps_act": None, "surprise_pct": None})
+        if not rows:
+            raise DataError(f"no earnings dates for {sym}")
+        return sorted(rows, key=lambda r: r["date"])
+
+    def demo():
+        sector = UNIVERSE_SECTOR.get(sym) or _demo_meta(sym)[1]
+        if sector in ("ETF", "Index", "FX", "Commodity", "Crypto", "Rates") or sym.startswith("^") or "=" in sym:
+            raise DataError(f"{sym} has no earnings (not a single stock)")
+        rng = np.random.default_rng(_seed(sym) + 11)
+        anchor = date.today() + timedelta(days=int(rng.integers(3, 80)))
+        rows = []
+        for q in range(-4, 2):
+            d = anchor + timedelta(days=91 * q)
+            est = float(rng.uniform(0.5, 4))
+            act = est * (1 + float(rng.normal(0.03, 0.06))) if d < date.today() else None
+            rows.append({"date": d.isoformat(), "eps_est": est, "eps_act": act,
+                         "surprise_pct": (act / est - 1) * 100 if act else None})
+        return rows
+
+    return _with_fallback("yahoo", live, demo)
+
+
+# Scheduled FOMC decision days (second day of each meeting). Source: federalreserve.gov calendars.
+FOMC_DATES = ["2025-01-29", "2025-03-19", "2025-05-07", "2025-06-18", "2025-07-30", "2025-09-17", "2025-10-29",
+              "2025-12-10", "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17", "2026-07-29", "2026-09-16",
+              "2026-10-28", "2026-12-09"]
+
+
+def macro_calendar(days_ahead: int = 45) -> list[dict]:
+    """Recurring US macro releases. FOMC dates are published; CPI/NFP/PCE/GDP dates are rule-based estimates
+    (NFP = first Friday) and can be off by a few days around holidays."""
+    today = date.today()
+    end = today + timedelta(days=days_ahead)
+    out = [{"date": d, "event": "FOMC rate decision", "kind": "central bank", "estimated": False}
+           for d in FOMC_DATES if today.isoformat() <= d <= end.isoformat()]
+    d = today.replace(day=1)
+    while d <= end:
+        first_fri = d + timedelta(days=(4 - d.weekday()) % 7)
+        for dt, ev in [(first_fri, "Nonfarm payrolls / unemployment"),
+                       (d + timedelta(days=11), "CPI inflation (approx.)"),
+                       (d + timedelta(days=26), "PCE inflation (approx.)")]:
+            if dt.weekday() >= 5:
+                dt += timedelta(days=7 - dt.weekday())
+            if today <= dt <= end:
+                out.append({"date": dt.isoformat(), "event": ev, "kind": "macro", "estimated": True})
+        if d.month in (1, 4, 7, 10):
+            gdp = d + timedelta(days=28)
+            if gdp.weekday() >= 5:
+                gdp -= timedelta(days=gdp.weekday() - 3)
+            if today <= gdp <= end:
+                out.append({"date": gdp.isoformat(), "event": "GDP advance estimate (approx.)", "kind": "macro", "estimated": True})
+        d = (d + timedelta(days=32)).replace(day=1)
+    return sorted(out, key=lambda x: x["date"])
+
+
+# --------------------------------------------------------------------------------------
+# diagnostics: `python run.py --check`
+# --------------------------------------------------------------------------------------
+def diagnose(verbose: bool = True) -> list[dict]:
+    """Exercise every live data call once and report which ones work. Used to debug Yahoo/FRED changes."""
+    if config.DATA_MODE == "demo":
+        raise SystemExit("--check needs live data; run without --demo")
+    checks = [
+        ("Yahoo reachable", lambda: online("yahoo") or (_ for _ in ()).throw(DataError("unreachable"))),
+        ("FRED reachable", lambda: online("fred") or (_ for _ in ()).throw(DataError("unreachable"))),
+        ("history AAPL 1y", lambda: f"{len(history('AAPL', '1y').data)} bars"),
+        ("closes SPY,TLT", lambda: f"{closes(('SPY', 'TLT'), '1y').data.shape}"),
+        ("quotes WEI", lambda: f"{sum(q.get('last') is not None for q in quotes(tuple(MONITORS['WEI'])).data)}/{len(MONITORS['WEI'])} quoted"),
+        ("info AAPL", lambda: f"{len(info('AAPL').data)} fields, PE={info('AAPL').data.get('trailingPE')}"),
+        ("financials MSFT", lambda: f"{len(financials('MSFT').data['income']['rows'])} income rows"),
+        ("news NVDA", lambda: f"{len(news('NVDA').data)} items"),
+        ("option expiries SPY", lambda: f"{len(option_expiries('SPY').data)} expiries"),
+        ("option chain SPY", lambda: f"{len(option_chain('SPY', option_expiries('SPY').data[2]).data['calls'])} calls"),
+        ("intraday SPY 5m", lambda: f"{len(intraday('SPY', '5m', 1).data)} bars"),
+        ("live quote AAPL", lambda: f"{live_quotes(('AAPL',)).data[0]['last']}"),
+        ("earnings AAPL", lambda: f"next/last: {earnings_date('AAPL').data[-1]['date']}"),
+        ("search 'nestle'", lambda: f"{len(search('nestle').data)} matches"),
+        ("FRED DGS10", lambda: f"last {fred('DGS10').data.iloc[-1]:.2f}%"),
+        ("yield curve", lambda: f"as of {yield_curve().data['asof']}"),
+    ]
+    results = []
+    for name, fn in checks:
+        t0 = time.time()
+        try:
+            msg, ok = str(fn()), True
+        except Exception as e:  # noqa: BLE001
+            msg, ok = f"{type(e).__name__}: {e}", False
+        results.append({"check": name, "ok": ok, "detail": msg, "secs": round(time.time() - t0, 2)})
+        if verbose:
+            print(f"  {'OK  ' if ok else 'FAIL'}  {name:<22} {msg[:90]}  ({results[-1]['secs']}s)")
+    return results

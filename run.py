@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Start QuantTerm:  python run.py [--demo|--live] [--port 8765] [--no-browser]"""
+"""Start QuantTerm:  python run.py [--demo|--live|--check] [--port 8765] [--no-browser]"""
 import argparse
 import os
 import threading
@@ -13,7 +13,20 @@ def main():
     ap.add_argument("--host", default=os.environ.get("QT_HOST", "127.0.0.1"))
     ap.add_argument("--port", type=int, default=int(os.environ.get("QT_PORT", "8765")))
     ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--check", action="store_true", help="test every live Yahoo/FRED data call and exit")
     a = ap.parse_args()
+    if a.check:
+        os.environ["QT_DATA"] = "live"
+        from quantterm.data.providers import diagnose
+
+        print("\n  QuantTerm live data check (Yahoo Finance + FRED)\n")
+        res = diagnose()
+        bad = [r for r in res if not r["ok"]]
+        print(f"\n  {len(res) - len(bad)}/{len(res)} checks passed.")
+        if bad:
+            print("  Paste the FAIL lines into Claude Code to get them fixed. Upgrading yfinance often helps:")
+            print("    pip install -U yfinance")
+        raise SystemExit(1 if bad else 0)
     if a.demo:
         os.environ["QT_DATA"] = "demo"
     elif a.live:

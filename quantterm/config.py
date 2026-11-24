@@ -22,3 +22,8 @@ PAPER_DB = HOME / "paper.db"
 PAPER_START_CASH = float(os.environ.get("QT_PAPER_CASH", "1000000"))
 PAPER_SLIPPAGE_BPS = float(os.environ.get("QT_SLIPPAGE_BPS", "2"))
 PAPER_COMMISSION = float(os.environ.get("QT_COMMISSION", "1.0"))  # per order, account currency
+
+BROKER = os.environ.get("QT_BROKER", "paper").lower()  # paper | alpaca
+
+# AI assistant (ASK). Uses the Anthropic API when credentials are configured.
+AI_MODEL = os.environ.get("QT_AI_MODEL", "claude-opus-5-5")

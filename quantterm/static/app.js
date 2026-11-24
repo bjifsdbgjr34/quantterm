@@ -89,36 +89,48 @@ const GROUPS = {};
 function reg(code, group, desc, render, o = {}) { FUNCS[code] = { code, group, desc, render, ...o }; (GROUPS[group] ||= []).push(code); }
 
 // ------------------------------------------------------------------ panels
-const state = { panels: [], active: 0, layout: 4, history: JSON.parse(localStorage.getItem('qt.hist') || '[]'), hidx: -1 };
-const DEFAULT_PANELS = ['WEI', 'SPY GP', 'MC SPY', 'GC', 'W', 'TRADE'];
+function lsGet(k, dflt) { try { const v = localStorage.getItem(k); return v === null ? dflt : JSON.parse(v); } catch { return dflt; } }
+function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { } }
+const state = { panels: [], active: 0, layout: 4, history: lsGet('qt.hist', []), hidx: -1, links: lsGet('qt.links', {}) };
+const DEFAULT_PANELS = ['BRIEF', 'SPY GP', 'W', 'MAP', 'GC', 'TRADE'];
 
 class Panel {
   constructor(idx) {
     this.idx = idx; this.cmd = ''; this.timer = null; this.st = {};
     this.el = document.createElement('section'); this.el.className = 'panel';
+    this.disposers = [];
     this.el.innerHTML = `<div class="ptitle"><span class="pn">${idx + 1}</span><span class="pc"></span><span class="pd"></span><span class="src hidden"></span>
+      <button title="Link group: panels in the same group follow each other's ticker (click to cycle A/B/C/off)" data-a="l" class="link"></button>
+      <button title="Export: PNG / Excel / PDF" data-a="x">⤓</button>
       <button title="Refresh" data-a="r">⟳</button><button title="Maximise / restore" data-a="m">▢</button></div><div class="pbody"></div>`;
     this.body = $('.pbody', this.el);
     this.el.addEventListener('mousedown', () => setActive(this.idx));
     $('[data-a=r]', this.el).onclick = e => { e.stopPropagation(); this.run(this.cmd); };
     $('[data-a=m]', this.el).onclick = e => { e.stopPropagation(); toggleMax(this.idx); };
+    $('[data-a=l]', this.el).onclick = e => { e.stopPropagation(); cycleLink(this.idx); };
+    $('[data-a=x]', this.el).onclick = e => { e.stopPropagation(); exportMenu(this, e.currentTarget); };
+    this.paintLink();
     new ResizeObserver(() => $$('.js-plotly-plot', this.body).forEach(p => Plotly.Plots.resize(p))).observe(this.body);
   }
   setTitle(code, desc) { $('.pc', this.el).textContent = code; $('.pd', this.el).textContent = desc || ''; }
   setSource(src) {
     const s = $('.src', this.el);
     if (!src) { s.classList.add('hidden'); return; }
-    s.classList.remove('hidden'); s.className = 'src ' + (src === 'demo' ? 'demo' : 'live');
+    s.classList.remove('hidden'); s.className = 'src ' + (src === 'demo' || /LIVE/.test(src) ? 'demo' : 'live');
     s.textContent = src === 'demo' ? 'DEMO DATA' : src.toUpperCase();
   }
   loading(msg = 'LOADING') { this.body.innerHTML = `<div class="loading">${msg}…</div>`; }
   error(e) { this.body.innerHTML = `<div class="err">⚠ ${esc(e.message || e)}</div>`; }
+  paintLink() { const g = state.links[this.idx] || ''; const b = $('[data-a=l]', this.el); b.textContent = g || '·'; b.className = 'link ' + (g ? 'g' + g : ''); }
+  onDispose(fn) { this.disposers.push(fn); }
+  dispose() { clearInterval(this.timer); this.timer = null; this.disposers.splice(0).forEach(f => { try { f(); } catch { } }); }
   every(sec, fn) { clearInterval(this.timer); this.timer = setInterval(() => { if (document.visibilityState === 'visible') fn().catch(() => {}); }, sec * 1000); }
-  async run(cmdline) {
-    clearInterval(this.timer); this.timer = null; this.started = true;
+  async run(cmdline, fromLink = false) {
+    this.dispose(); this.started = true;
     const p = parse(cmdline);
     if (!p) { this.error(`Unknown command "${cmdline}". Type HELP for the function list.`); return; }
-    this.cmd = p.canonical; this.st = {};
+    this.cmd = p.canonical; this.st = {}; this.fn = p.fn; this.sym = p.sym; this.args = p.args; this.raw = cmdline;
+    if (!fromLink && p.sym) propagateLink(this.idx, p.sym);
     this.setTitle(p.canonical, FUNCS[p.fn].desc); this.setSource(null);
     savePanels();
     this.loading();
@@ -155,7 +167,7 @@ function buildGrid() {
 function setLayout(n) {
   state.layout = n;
   state.panels.forEach((p, i) => { if (i < n && !p.started) p.run(p.cmd || DEFAULT_PANELS[i] || 'HELP'); });
-  localStorage.setItem('qt.layout', n); buildGrid();
+  lsSet('qt.layout', n); buildGrid();
 }
 let _maxRestore = null;
 function toggleMax(i) {
@@ -165,9 +177,100 @@ function toggleMax(i) {
   setTimeout(() => $$('.js-plotly-plot').forEach(p => Plotly.Plots.resize(p)), 50);
 }
 function setActive(i) { state.active = i; state.panels.forEach((p, j) => p.el.classList.toggle('active', i === j)); }
-function savePanels() { localStorage.setItem('qt.panels', JSON.stringify(state.panels.map(p => p.cmd))); }
+function savePanels() { lsSet('qt.panels', state.panels.map(p => p.cmd)); }
 function runIn(cmdline, idx = state.active) { state.panels[idx].run(cmdline); setActive(idx); }
 function goto(cmdline) { runIn(cmdline, state.active); }
+
+// ------------------------------------------------------------------ linked panels (Bloomberg-style groups)
+const LINK_GROUPS = ['', 'A', 'B', 'C'];
+function cycleLink(i) {
+  const cur = state.links[i] || '', next = LINK_GROUPS[(LINK_GROUPS.indexOf(cur) + 1) % LINK_GROUPS.length];
+  if (next) state.links[i] = next; else delete state.links[i];
+  lsSet('qt.links', state.links); state.panels[i].paintLink();
+}
+function propagateLink(src, sym) {
+  const g = state.links[src]; if (!g) return;
+  state.panels.forEach((p, j) => {
+    if (j === src || state.links[j] !== g || j >= state.layout || !p.fn || !FUNCS[p.fn].sym || p.sym === sym) return;
+    p.run(`${sym} ${p.fn}${p.args && p.args.length ? ' ' + p.args.join(' ') : ''}`, true);
+  });
+}
+
+// ------------------------------------------------------------------ export (PNG / Excel / PDF)
+function tableRows(t) { return $$('tr', t).map(tr => $$('th,td', tr).map(c => c.textContent.trim())); }
+function download(blob, name) { const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 5000); }
+function exportMenu(panel, btn) {
+  $$('.xmenu').forEach(m => m.remove());
+  const m = document.createElement('div'); m.className = 'xmenu';
+  m.innerHTML = '<div data-x="png">Charts → PNG</div><div data-x="xlsx">Tables → Excel</div><div data-x="pdf">Panel → PDF / print</div>';
+  btn.parentElement.appendChild(m);
+  const name = (panel.cmd || 'panel').replace(/[^\w.-]+/g, '_');
+  m.onclick = async e => {
+    e.stopPropagation();
+    const k = e.target.dataset.x; m.remove();
+    try {
+      if (k === 'png') {
+        const charts = $$('.js-plotly-plot', panel.body);
+        if (!charts.length) return toast('No charts in this panel', 'warn');
+        for (const [i, c] of charts.entries()) await Plotly.downloadImage(c, { format: 'png', width: c.clientWidth * 2, height: c.clientHeight * 2, filename: `${name}_${i + 1}` });
+      } else if (k === 'xlsx') {
+        const ts = $$('table.t', panel.body);
+        if (!ts.length) return toast('No tables in this panel', 'warn');
+        const r = await fetch('/api/export/xlsx', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filename: name, sheets: ts.map((t, i) => ({ name: `${panel.fn || 'Table'} ${i + 1}`, rows: tableRows(t) })) }) });
+        if (!r.ok) throw new Error('export failed'); download(await r.blob(), name + '.xlsx');
+      } else if (k === 'pdf') {
+        document.body.classList.add('printing'); panel.el.classList.add('printme');
+        $$('.js-plotly-plot', panel.body).forEach(p => Plotly.Plots.resize(p));
+        setTimeout(() => { window.print(); document.body.classList.remove('printing'); panel.el.classList.remove('printme'); $$('.js-plotly-plot').forEach(p => Plotly.Plots.resize(p)); }, 250);
+      }
+    } catch (err) { toast(esc(err.message), 'err'); }
+  };
+  setTimeout(() => document.addEventListener('click', () => m.remove(), { once: true }), 0);
+}
+
+// ------------------------------------------------------------------ toasts, alerts & notifications
+function toast(msg, kind = 'info', ms = 6000) {
+  let box = $('#toasts'); if (!box) { box = document.createElement('div'); box.id = 'toasts'; document.body.appendChild(box); }
+  const t = document.createElement('div'); t.className = 'toast ' + kind; t.innerHTML = msg; box.appendChild(t);
+  t.onclick = () => t.remove(); setTimeout(() => t.remove(), ms);
+}
+function beep() { try { const a = new AudioContext(), o = a.createOscillator(), g = a.createGain(); o.frequency.value = 880; g.gain.value = 0.05; o.connect(g); g.connect(a.destination); o.start(); setTimeout(() => { o.stop(); a.close(); }, 180); } catch { } }
+async function pollAlerts() {
+  try {
+    const r = await api('/api/alerts/check');
+    for (const a of r.fired || []) {
+      const what = { above: `≥ ${fmtPx(a.level)}`, below: `≤ ${fmtPx(a.level)}`, move: `moved ${fmt(a.value)}%`, vol: `10d vol ${fmt(a.value)}%` }[a.kind];
+      const msg = `<b class="amb">ALERT ${esc(a.symbol)}</b> ${what} · last ${fmtPx(a.last)}${a.note ? ' · ' + esc(a.note) : ''}${r.source === 'demo' ? ' <span class="neg">(DEMO DATA)</span>' : ''}`;
+      toast(msg, 'alert', 20000); beep();
+      if (window.Notification && Notification.permission === 'granted') new Notification(`QuantTerm alert: ${a.symbol}`, { body: msg.replace(/<[^>]+>/g, '') });
+    }
+    const n = (await api('/api/alerts')).alerts.filter(a => a.active).length;
+    $('#st-alerts').innerHTML = n ? `ALERTS <b class="amb">${n}</b>` : '';
+  } catch { }
+}
+
+// ------------------------------------------------------------------ workspaces
+async function refreshWorkspaces(select) {
+  try {
+    const r = await api('/api/workspaces'); const sel = $('#wssel');
+    sel.innerHTML = '<option value="">WORKSPACE…</option>' + r.workspaces.map(w => `<option ${w.name === select ? 'selected' : ''}>${esc(w.name)}</option>`).join('') + '<option value="__save">＋ Save current as…</option>';
+    state.workspaces = r.workspaces;
+  } catch { }
+}
+function currentWorkspace() { return { layout: state.layout, panels: state.panels.map(p => p.cmd), links: state.links }; }
+async function saveWorkspace(name) {
+  name = name || prompt('Name this workspace (e.g. Morning, Options desk):'); if (!name) return;
+  await api('/api/workspaces', { name, ...currentWorkspace() }); toast(`Workspace <b>${esc(name)}</b> saved`); refreshWorkspaces(name);
+}
+function loadWorkspace(name) {
+  const w = (state.workspaces || []).find(x => x.name === name); if (!w) return;
+  _maxRestore = null; state.links = w.links || {}; lsSet('qt.links', state.links);
+  state.panels.forEach((p, i) => { p.paintLink(); p.cmd = w.panels[i] || ''; p.started = false; });
+  state.layout = w.layout; lsSet('qt.layout', w.layout); buildGrid();
+  state.panels.forEach((p, i) => { if (i < w.layout) p.run(w.panels[i] || DEFAULT_PANELS[i] || 'HELP', true); });
+  savePanels(); toast(`Loaded workspace <b>${esc(name)}</b>`);
+}
 
 // ------------------------------------------------------------------ command line + autocomplete
 const cmd = $('#cmd'), sug = $('#suggest');
@@ -199,8 +302,9 @@ function updateSuggest() {
   }
 }
 function submit(newPanel = false) {
-  const v = cmd.value.trim(); if (!v) return;
-  state.history = [v, ...state.history.filter(h => h !== v)].slice(0, 100); localStorage.setItem('qt.hist', JSON.stringify(state.history)); state.hidx = -1;
+  let v = cmd.value.trim(); if (!v) return;
+  if (v.startsWith('?')) v = 'ASK ' + v.slice(1).trim();
+  state.history = [v, ...state.history.filter(h => h !== v)].slice(0, 100); lsSet('qt.hist', state.history); state.hidx = -1;
   const target = newPanel ? (state.active + 1) % state.layout : state.active;
   runIn(v, target); cmd.value = ''; sugItems = []; renderSuggest();
 }
@@ -254,6 +358,8 @@ async function loadStatus() {
   try {
     const s = await api('/api/status');
     $('#st-mode').innerHTML = `MODE <b class="amb">${s.mode.toUpperCase()}</b>`;
+    $('#st-broker').innerHTML = s.broker_error ? `<span class="neg" title="${esc(s.broker_error)}">BROKER ERROR → PAPER</span>` : `BROKER <b class="${s.broker_live ? 'neg' : 'amb'}">${s.broker.toUpperCase()}${s.broker_live ? ' · LIVE MONEY' : ''}</b>`;
+    $('#st-ai').innerHTML = `AI <b class="${s.ai ? 'pos' : 'dim'}">${s.ai ? 'ON' : 'OFF'}</b>`;
     $('#st-src').innerHTML = `YAHOO <b class="${s.yahoo ? 'pos' : 'neg'}">${s.yahoo ? 'ONLINE' : 'OFFLINE'}</b> · FRED <b class="${s.fred ? 'pos' : 'neg'}">${s.fred ? 'ONLINE' : 'OFFLINE'}</b>${!s.yahoo ? ' · <span class="neg">showing synthetic demo data</span>' : ''}`;
   } catch { $('#st-mode').innerHTML = '<span class="neg">SERVER UNREACHABLE</span>'; }
 }
@@ -279,10 +385,26 @@ for (const [code, desc] of Object.entries(MONITOR_DESC)) {
   });
 }
 
+// ------------------------------------------------------------------ streaming quotes (server-sent events)
+function liveStream(panel, syms, onQuotes, interval = 5) {
+  if (!window.EventSource || !syms.length) return;
+  const es = new EventSource(`/api/stream?symbols=${encodeURIComponent(syms.join(','))}&interval=${interval}`);
+  es.onmessage = e => { try { const d = JSON.parse(e.data); onQuotes(d.quotes, d.source); } catch { } };
+  panel.onDispose(() => es.close());
+  return es;
+}
+function flashPrices(root, quotes) {
+  for (const q of quotes) $$(`[data-lp="${CSS.escape(q.symbol)}"]`, root).forEach(el => {
+    const old = +el.dataset.v; el.dataset.v = q.last; el.textContent = fmtPx(q.last);
+    if (isNum(old) && old !== q.last) { el.className = ''; void el.offsetWidth; el.className = q.last > old ? 'flash-up' : 'flash-dn'; }
+  });
+}
+
 // ================================================================== WATCHLIST
-function wl() { return JSON.parse(localStorage.getItem('qt.watch') || '["AAPL","MSFT","NVDA","SPY","QQQ","NESN.SW","BTC-USD","GC=F"]'); }
+function wl() { return lsGet('qt.watch', ['AAPL', 'MSFT', 'NVDA', 'SPY', 'QQQ', 'NESN.SW', 'BTC-USD', 'GC=F']); }
+function setWl(list) { lsSet('qt.watch', [...new Set(list)]); }
 reg('W', 'Markets', 'Watchlist (add/remove symbols, saved locally)', async (p, _s, args) => {
-  if (args.length) { localStorage.setItem('qt.watch', JSON.stringify([...new Set([...wl(), ...args])])); }
+  if (args.length) { setWl([...wl(), ...args]); }
   const load = async () => {
     const list = wl();
     const tools = `<div class="toolbar"><input id="wa${p.idx}" placeholder="add symbol(s)…" style="width:200px"><button id="wb${p.idx}">ADD</button><span class="dim">Click a symbol for its overview</span></div>`;
@@ -290,18 +412,19 @@ reg('W', 'Markets', 'Watchlist (add/remove symbols, saved locally)', async (p, _
     else {
       const r = await api('/api/quote?symbols=' + encodeURIComponent(list.join(','))); p.setSource(r.source);
       p.body.innerHTML = tools + table([
-        { h: 'Symbol', l: 1, f: q => `<b class="amb">${esc(q.symbol)}</b>` }, { h: 'Last', f: q => fmtPx(q.last) },
+        { h: 'Symbol', l: 1, f: q => `<b class="amb">${esc(q.symbol)}</b>` }, { h: 'Last', f: q => `<span data-lp="${esc(q.symbol)}" data-v="${q.last}">${fmtPx(q.last)}</span>` },
         { h: 'Chg', f: q => signed(q.chg) }, { h: '%Chg', f: q => signed(q.pct, 2, '%') }, { h: 'WTD', f: q => signed(q.wtd, 2, '%') },
         { h: 'YTD', f: q => signed(q.ytd, 2, '%') }, { h: 'Volume', f: q => big(q.volume) }, { h: '30D', f: q => spark(q.spark) },
         { h: '', f: q => `<button class="danger" data-rm="${esc(q.symbol)}">✕</button>` },
       ], r.quotes, { click: 1 });
       $$('tr.click', p.body).forEach(tr => tr.onclick = e => { if (e.target.dataset.rm) return; goto(r.quotes[+tr.dataset.i].symbol + ' DES'); });
-      $$('[data-rm]', p.body).forEach(b => b.onclick = e => { e.stopPropagation(); localStorage.setItem('qt.watch', JSON.stringify(wl().filter(s => s !== b.dataset.rm))); load(); });
+      $$('[data-rm]', p.body).forEach(b => b.onclick = e => { e.stopPropagation(); setWl(wl().filter(s => s !== b.dataset.rm)); load(); });
     }
-    const add = () => { const v = $(`#wa${p.idx}`).value.toUpperCase().split(/[\s,]+/).filter(Boolean); if (v.length) { localStorage.setItem('qt.watch', JSON.stringify([...new Set([...wl(), ...v])])); load(); } };
+    const add = () => { const v = $(`#wa${p.idx}`).value.toUpperCase().split(/[\s,]+/).filter(Boolean); if (v.length) { setWl([...wl(), ...v]); load(); } };
     $(`#wb${p.idx}`).onclick = add; $(`#wa${p.idx}`).onkeydown = e => { if (e.key === 'Enter') { e.stopPropagation(); add(); } };
   };
   await load(); p.every(30, load);
+  liveStream(p, wl(), qs => flashPrices(p.body, qs), 5);
 });
 
 // ================================================================== DES
@@ -341,7 +464,7 @@ reg('DES', 'Security', 'Description, key stats & risk profile', async (p, sym) =
     <div class="row"><div><h3>Fundamentals</h3>${kv(fundamentals)}</div><div><h3>Risk & Performance (1Y)</h3>${kv(risk)}</div></div>`;
   $$('[data-go]', p.body).forEach(b => b.onclick = () => goto(`${r.symbol} ${b.dataset.go}`));
   $('[data-trade]', p.body).onclick = () => goto(`TRADE ${r.symbol}`);
-  $('[data-watch]', p.body).onclick = e => { localStorage.setItem('qt.watch', JSON.stringify([...new Set([...wl(), r.symbol])])); e.target.textContent = '✓ WATCHING'; };
+  $('[data-watch]', p.body).onclick = e => { setWl([...wl(), r.symbol]); e.target.textContent = '✓ WATCHING'; };
   plot(id, [{ x: r.spark.dates, y: r.spark.close, type: 'scatter', mode: 'lines', line: { color: '#fb8b1e', width: 1.5 }, fill: 'tozeroy', fillcolor: 'rgba(251,139,30,0.08)', name: r.symbol }],
     { showlegend: false, margin: { t: 8 }, yaxis: { range: [Math.min(...r.spark.close) * 0.97, Math.max(...r.spark.close) * 1.02] } });
 }, { sym: 1 });
@@ -448,28 +571,32 @@ reg('SRCH', 'Markets', 'Search securities by name or ticker', async (p, _s, args
 
 // ================================================================== HELP
 reg('HELP', 'System', 'Function directory & keyboard guide', async p => {
-  const order = ['Markets', 'Security', 'Analytics', 'Derivatives', 'Quant Lab', 'Monte Carlo', 'Portfolio & Trading', 'Macro', 'System'];
+  const order = ['Markets', 'Security', 'Analytics', 'Derivatives', 'Quant Lab', 'Monte Carlo', 'Portfolio & Trading', 'Macro', 'Research', 'System'];
   const ex = { DES: 'AAPL', GP: 'NVDA GP 2Y', HP: 'MSFT HP', FA: 'AAPL FA', N: 'TSLA N', G: 'G AAPL MSFT NVDA', CORR: 'CORR SPY TLT GLD BTC-USD', BETA: 'NVDA BETA',
     VOL: 'SPY VOL', OMON: 'AAPL OMON', VOLS: 'SPY VOLS', OVME: 'OVME AAPL', BT: 'BT SPY', PORT: 'PORT SPY TLT GLD QQQ', MC: 'MC NVDA', MCO: 'MCO',
     MCP: 'MCP SPY TLT GLD', GARCH: 'SPY GARCH', STAT: 'SPY STAT', PAIR: 'PAIR XOM CVX', PCA: 'PCA XLK XLF XLE XLV XLI XLY XLP', TRADE: 'TRADE AAPL',
-    GC: 'GC', ECO: 'ECO', W: 'W', SRCH: 'SRCH nestle' };
+    GC: 'GC', ECO: 'ECO', W: 'W', SRCH: 'SRCH nestle', EQS: 'EQS', MAP: 'MAP', LIVE: 'NVDA LIVE', ALRT: 'ALRT NVDA', EVT: 'EVT', ERN: 'AAPL ERN',
+    FF: 'NVDA FF', WF: 'WF SPY', MBT: 'MBT SPY EFA EEM TLT GLD', SKEW: 'SPY SKEW', OSCAN: 'SPY OSCAN', NOTE: 'NOTE', WS: 'WS', ASK: 'ASK why is SPY vol rising?', BRIEF: 'BRIEF' };
   p.body.innerHTML = `<h2>QuantTerm function directory</h2>
     <p class="dim">Syntax like Bloomberg: <span class="code">TICKER FUNCTION</span> or <span class="code">FUNCTION ARGS</span>. A bare ticker opens DES.
     Bloomberg-style tickers work too: <span class="code">SPX INDEX</span>, <span class="code">EURUSD CURNCY</span>, <span class="code">SMI</span>. Swiss stocks use <span class="code">.SW</span> (e.g. NESN.SW).</p>
     <div class="helpgrid">${order.filter(g => GROUPS[g]).map(g => `<section><h3>${g}</h3>${GROUPS[g].map(c => `<p data-c="${esc(ex[c] || c)}"><b>${c}</b>${esc(FUNCS[c].desc)} <span class="dim">${ex[c] ? '· ' + esc(ex[c]) : ''}</span></p>`).join('')}</section>`).join('')}</div>
-    <h3>Keyboard</h3><p class="dim">Start typing anywhere to focus the command line · Enter = run in focused panel · Shift+Enter = run in next panel · Tab = accept suggestion · ↑/↓ = history · Ctrl+1…6 = focus panel · F1 = help · ▢ on a panel = maximise.</p>`;
+    <h3>Keyboard</h3><p class="dim">Start typing anywhere to focus the command line · Enter = run in focused panel · Shift+Enter = run in next panel · Tab = accept suggestion · ↑/↓ = history · Ctrl+1…6 = focus panel · F1 = help · ▢ on a panel = maximise · ⤓ = export PNG/Excel/PDF · the dot/letter chip links panels (same letter = same ticker) · ? at the start of a line asks the AI assistant.</p>`;
   $$('[data-c]', p.body).forEach(e => e.onclick = () => goto(e.dataset.c));
 });
 
 // ------------------------------------------------------------------ boot
 window.addEventListener('load', () => {
-  const saved = JSON.parse(localStorage.getItem('qt.panels') || 'null');
-  const n = +(localStorage.getItem('qt.layout') || 4);
+  const saved = lsGet('qt.panels', null);
+  const n = +lsGet('qt.layout', 4);
   for (let i = 0; i < 6; i++) state.panels.push(new Panel(i));
   state.layout = n; buildGrid(); setActive(0);
   state.panels.forEach((p, i) => { if (i < n) p.run((saved && saved[i]) || DEFAULT_PANELS[i] || 'HELP'); else p.cmd = (saved && saved[i]) || ''; });
   tickClocks(); setInterval(tickClocks, 15000);
   loadStatus(); setInterval(loadStatus, 60000);
   loadTape(); setInterval(loadTape, 60000);
+  pollAlerts(); setInterval(pollAlerts, 20000);
+  refreshWorkspaces();
+  $('#wssel').onchange = e => { const v = e.target.value; if (v === '__save') { saveWorkspace(); e.target.value = ''; } else if (v) loadWorkspace(v); };
   cmd.focus();
 });

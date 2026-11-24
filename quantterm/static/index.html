@@ -15,6 +15,7 @@
     <input id="cmd" autocomplete="off" spellcheck="false" placeholder="Type a command, e.g.  AAPL GP   ·   MC SPY   ·   PORT SPY TLT GLD   ·   HELP   — then Enter">
     <div id="suggest" class="hidden"></div>
   </div>
+  <select id="wssel" title="Saved workspaces: load one, or save the current layout"><option value="">WORKSPACE…</option></select>
   <div id="layouts" title="Panel layout">
     <button data-layout="1">1</button><button data-layout="2">2</button><button data-layout="3">3</button><button data-layout="4">4</button><button data-layout="6">6</button>
   </div>
@@ -25,10 +26,14 @@
 <footer id="status">
   <span id="st-mode"></span>
   <span id="st-src"></span>
-  <span class="hint">Click a panel to focus it · Enter runs in focused panel · Shift+Enter opens in next panel · ↑/↓ history · Ctrl+1..6 select panel · F1 help · Esc clear</span>
+  <span id="st-broker"></span>
+  <span id="st-ai"></span>
+  <span id="st-alerts"></span>
+  <span class="hint">Click a panel to focus it · Enter runs in focused panel · Shift+Enter opens in next panel · ↑/↓ history · Ctrl+1..6 select panel · ?question asks the AI · F1 help · Esc clear</span>
   <span id="st-time"></span>
 </footer>
 <script src="/static/app.js"></script>
 <script src="/static/quant.js"></script>
+<script src="/static/research.js"></script>
 </body>
 </html>
