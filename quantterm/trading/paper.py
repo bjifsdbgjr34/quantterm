@@ -28,6 +28,9 @@ CREATE TABLE IF NOT EXISTS equity_log (ts TEXT PRIMARY KEY, equity REAL);
 
 
 class PaperBroker:
+    name = "paper"
+    live = False
+
     def __init__(self, path: Path | str = config.PAPER_DB):
         self.path = str(path)
         with self._conn() as c:

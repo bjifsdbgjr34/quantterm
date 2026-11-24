@@ -184,7 +184,7 @@ reg('BT', 'Quant Lab', 'Strategy backtester: built-in or custom formula, costs, 
     <label>Cost (bps/turnover)<input name="cost_bps" type="number" step="any" value="5"></label><label>Vol target % (blank=off)<input name="vol_target" type="number" step="any" placeholder="e.g. 15"></label>
     <label>Max leverage<input name="max_leverage" type="number" step="any" value="2"></label><label>Allow short<select name="allow_short">${opts([['false', 'No'], ['true', 'Yes']], 'false')}</select></label>
     <label class="wide">Signal formula (position = value; true→1, false→0)<textarea name="expr"></textarea></label>
-    <div class="actions"><button class="primary" type="submit">RUN BACKTEST</button><button type="button" data-opt>OPTIMISE PARAMETERS</button>
+    <div class="actions"><button class="primary" type="submit">RUN BACKTEST</button><button type="button" data-opt>OPTIMISE PARAMETERS</button><button type="button" data-wf>WALK-FORWARD TEST →</button>
       <span class="dim">Functions: ${funcs.join(', ')} · variables: close open high low volume · operators: + - * / > < and or not</span></div></form><div class="out"></div>`;
   const form = $('form', p.body), out = $('.out', p.body), sel = $('[name=strategy]', form), ex = $('[name=expr]', form);
   const fill = () => { if (sel.value !== 'custom') { const s = strats[sel.value]; ex.value = s.expr.replace(/\{(\w+)\}/g, (_, k) => s.params[k]); } };
@@ -216,7 +216,7 @@ reg('BT', 'Quant Lab', 'Strategy backtester: built-in or custom formula, costs, 
     out.innerHTML = '<div class="loading">RUNNING PARAMETER GRID…</div>';
     const r = await api('/api/backtest/optimize', { symbol: f.symbol, period: f.period, strategy: f.strategy, cost_bps: +f.cost_bps });
     const keys = Object.keys(r.grid), a = uid();
-    out.innerHTML = `<div class="banner">In-sample optimisation — beware of overfitting. Prefer broad plateaus over single peaks, and validate out-of-sample.</div><div id="${a}" class="chart tall"></div>`;
+    out.innerHTML = `<div class="banner">In-sample optimisation — beware of overfitting. Prefer broad plateaus over single peaks, and validate out-of-sample with <span class="code">WF</span> (walk-forward).</div><div id="${a}" class="chart tall"></div>`;
     if (keys.length === 2) {
       const [k1, k2] = keys, z = r.grid[k2].map(v2 => r.grid[k1].map(v1 => (r.results.find(x => x[k1] === v1 && x[k2] === v2) || {}).value ?? null));
       plot(a, [{ z, x: r.grid[k1].map(String), y: r.grid[k2].map(String), type: 'heatmap', colorscale: 'Viridis', text: z.map(rw => rw.map(v => v === null ? '' : v.toFixed(2))), texttemplate: '%{text}' }],
@@ -227,6 +227,7 @@ reg('BT', 'Quant Lab', 'Strategy backtester: built-in or custom formula, costs, 
   };
   form.onsubmit = e => { e.preventDefault(); run().catch(err => out.innerHTML = `<div class="err">${esc(err.message)}</div>`); };
   $('[data-opt]', p.body).onclick = () => optimise().catch(err => out.innerHTML = `<div class="err">${esc(err.message)}</div>`);
+  $('[data-wf]', p.body).onclick = () => { const f = formData(form); goto(`WF ${f.symbol} ${['custom', 'buy_hold'].includes(f.strategy) ? 'sma_cross' : f.strategy}`.toUpperCase()); };
   await run();
 });
 
@@ -519,12 +520,15 @@ reg('TRADE', 'Portfolio & Trading', 'Paper trading: order ticket, positions, P&L
     <label>Quantity<input name="qty" type="number" step="any" value="100" required></label><label>Order type<select name="type">${opts([['market', 'Market'], ['limit', 'Limit'], ['stop', 'Stop']], 'market')}</select></label>
     <label>Limit price<input name="limit_px" type="number" step="any"></label><label>Stop price<input name="stop_px" type="number" step="any"></label>
     <div class="actions"><button class="primary" type="submit">SEND ORDER</button><button type="button" class="danger" data-reset>RESET ACCOUNT</button>
-      <span class="dim">Simulated fills at last price ± 2bps slippage, $1/order. Paper only — no real orders are sent.</span></div></form>
+      <span class="dim brokernote">Simulated fills at last price ± 2bps slippage, $1/order. Paper only — no real orders are sent.</span></div></form>
     <div class="msg"></div><div class="acct"></div>`;
   const form = $('form', p.body), acct = $('.acct', p.body), msg = $('.msg', p.body);
   const load = async () => {
     const r = await api('/api/paper'), a = uid();
-    acct.innerHTML = `<div class="cards">${card('Equity', '$' + fmt(r.equity, 0))}${card('Cash', '$' + fmt(r.cash, 0))}${card('Total P&L', signed(r.pnl_total, 0))}${card('Return', signed(r.pnl_pct, 2, '%'))}
+    p.setSource(r.broker === 'paper' ? null : (r.live ? 'LIVE BROKER' : r.broker + ' paper'));
+    const note = $('.brokernote', p.body);
+    if (r.broker !== 'paper') note.innerHTML = r.live ? '<b class="neg">LIVE ACCOUNT — orders are sent to the market with real money.</b>' : `Orders go to your <b class="amb">${esc(r.broker)}</b> paper account.`;
+    acct.innerHTML = `${r.broker_error ? `<div class="banner">Broker "${esc(r.broker_error)}" — using the local paper broker instead.</div>` : ''}<div class="cards">${card('Equity', '$' + fmt(r.equity, 0))}${card('Cash', '$' + fmt(r.cash, 0))}${card('Total P&L', signed(r.pnl_total, 0))}${card('Return', signed(r.pnl_pct, 2, '%'))}
       ${card('Unrealized', signed(r.unrealized, 0))}${card('Realized', signed(r.realized, 0))}${card('Gross exp.', fmt(r.gross_exposure, 1) + '%')}${card('Net exp.', fmt(r.net_exposure, 1) + '%')}</div>
       <h3>Positions</h3>${r.positions.length ? table([{ h: 'Symbol', l: 1, f: x => `<b class="amb">${x.symbol}</b>` }, { h: 'Qty', f: x => fmt(x.qty, 0) }, { h: 'Avg px', f: x => fmtPx(x.avg_px) }, { h: 'Last', f: x => fmtPx(x.last) },
         { h: 'Mkt value', f: x => fmt(x.mkt_value, 0) }, { h: 'Weight', f: x => fmt(x.weight, 1) + '%' }, { h: 'Unreal. P&L', f: x => signed(x.unrealized, 0) }, { h: '%', f: x => signed(x.unrealized_pct, 2, '%') }, { h: 'Realized', f: x => signed(x.realized, 0) },
@@ -539,6 +543,7 @@ reg('TRADE', 'Portfolio & Trading', 'Paper trading: order ticket, positions, P&L
   };
   form.onsubmit = async e => {
     e.preventDefault(); const f = formData(form);
+    if ((await api('/api/broker')).live && !confirm(`LIVE ORDER with real money:\n${f.side} ${f.qty} ${f.symbol.toUpperCase()} (${f.type})\n\nSend it?`)) return;
     try { const r = await api('/api/paper/order', f); msg.innerHTML = `<div class="${r.order.status === 'FILLED' ? 'pos' : 'yel'}">Order #${r.order.id} ${r.order.side} ${r.order.qty} ${r.order.symbol}: ${r.order.status}${r.order.fill_px ? ' @ ' + fmtPx(r.order.fill_px) : ''}</div>`; load(); }
     catch (err) { msg.innerHTML = `<div class="err">${esc(err.message)}</div>`; }
   };

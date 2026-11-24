@@ -21,7 +21,15 @@ pip install -r requirements.txt
 python run.py            # auto: live data, with a synthetic fallback when offline
 python run.py --demo     # synthetic data only (offline development)
 python run.py --live     # live data only; errors are shown instead of falling back
+python run.py --check    # test every Yahoo / FRED call once and print OK / FAIL per feed
 ```
+
+Optional extras, all off by default:
+
+| Feature | Turn it on with |
+|---|---|
+| AI research assistant (`ASK`, or type `?question`) | `pip install anthropic`, then set `ANTHROPIC_API_KEY` (or run `ant auth login`). Model: `QT_AI_MODEL`, default `claude-opus-5-5` |
+| Alpaca broker in the `TRADE` screen | `QT_BROKER=alpaca`, `ALPACA_KEY_ID`, `ALPACA_SECRET_KEY`. It uses the paper endpoint unless `ALPACA_PAPER=0` **and** `QT_ALLOW_LIVE=1` |
 
 When live data can't be reached, every panel shows a red **DEMO DATA** badge, so synthetic numbers are never mistaken for real ones.
 
@@ -35,15 +43,21 @@ Bloomberg-style tickers also work, for example `SPX INDEX`, `EURUSD CURNCY` and 
 | Enter / Shift+Enter | run in focused panel / in next panel |
 | Tab, ↑ ↓ | accept suggestion, command history |
 | Ctrl+1…6 | focus panel |
+| `?why is SPY vol rising` | ask the AI assistant |
 | F1 | help |
 | layout buttons 1·2·3·4·6, ▢ | panel layout, maximise a panel |
+| `·` chip on a panel title | link group A/B/C: linked panels follow each other's ticker |
+| ⤓ on a panel title | export charts to PNG, tables to Excel, or the panel to PDF |
+| WORKSPACE menu | save / reload named layouts ("Morning", "Options desk") |
 
 ### Functions
 
 | Group | Code | What it does |
 |---|---|---|
 | Markets | `WEI` `FX` `CMDT` `CRYPTO` `RATES` `MAG7` `SWISS` `SECTORS` | Live monitors with day / week / YTD change and sparklines |
-| | `W` | Watchlist (saved in the browser) |
+| | `W` | Watchlist with streaming prices (saved in the browser) |
+| | `NVDA LIVE` | Intraday 1m–30m candles + VWAP, last price streamed every 5s |
+| | `ALRT` | Alerts: price above/below, daily move %, realized-vol spike. Toast, sound and desktop notification |
 | | `SRCH name` | Security search |
 | Security | `AAPL DES` | Description, fundamentals, 1-year risk profile |
 | | `AAPL GP 2Y` | Candles + volume + SMA/EMA/Bollinger/VWAP/RSI/MACD/Stoch/ATR/RealVol/Drawdown |
@@ -54,6 +68,8 @@ Bloomberg-style tickers also work, for example `SPX INDEX`, `EURUSD CURNCY` and 
 | | `SPY VOL` | Realized vol (close-to-close, EWMA, Parkinson), vol cone, VaR table |
 | Derivatives | `AAPL OMON` | Option chain with IV and greeks, put/call ratios, max pain, OI by strike, smile |
 | | `SPY VOLS` | 3D implied-vol surface, smiles, ATM term structure |
+| | `SPY SKEW` | 25Δ risk reversal / butterfly by expiry, term-structure state, implied vs realized vol |
+| | `SPY OSCAN` | Strategy scanner: 12 structures ranked by expected value under your vol forecast |
 | | `OVME AAPL` | Black-Scholes-Merton + American binomial pricer, full greeks (incl. vanna/volga/charm), 10 strategy payoffs |
 | Monte Carlo | `MC SPY` | 5 models: GBM, Student-t, block bootstrap, Merton jump-diffusion, GARCH. Fan chart, touch probabilities, VaR/CVaR, drawdown distribution, side-by-side model comparison |
 | | `MCO` | Monte Carlo exotic option pricer: Asian, barriers, lookback, digital. Antithetic variates, confidence intervals, convergence plot |
@@ -63,10 +79,20 @@ Bloomberg-style tickers also work, for example `SPX INDEX`, `EURUSD CURNCY` and 
 | | `SPY STAT` | Distribution fit (normal vs t), Q-Q, ACF, Jarque-Bera, Ljung-Box, ADF, Hurst, variance ratio, Kelly curve |
 | | `PAIR KO PEP` | Engle-Granger cointegration, hedge ratio, half-life, z-score strategy backtest |
 | | `PCA …` | Principal components, loadings, factor indices, absorption ratio |
+| | `WF SPY` | Walk-forward backtest: refit on a rolling past window, trade the next one, compare with the hindsight-optimised curve |
+| | `MBT SPY EFA EEM TLT GLD` | Multi-asset strategies: cross-sectional momentum, dual-momentum rotation, long/short, low-vol, inverse-vol |
 | Portfolio & Trading | `PORT …` | Max Sharpe / min variance / risk parity / max diversification / inverse vol / equal weight. Ledoit-Wolf covariance, efficient frontier, risk contributions, VaR, stress tests, share allocation |
 | | `TRADE AAPL` | Paper trading: market/limit/stop orders, long & short, P&L, blotter |
 | Macro | `GC` | US Treasury curve now vs 1W/1M/1Y ago, 2s10s / 3m10y / 5s30s |
 | | `ECO [FRED ids]` | Macro dashboard: Fed funds, CPI, core CPI, unemployment, payrolls, curve, HY spreads, mortgages… |
+| Research | `BRIEF` | Morning briefing: biggest moves, watchlist, next 7 days of events, portfolio VaR, triggered alerts |
+| | `EQS [filter]` | Equity screener over ~100 S&P large caps: `pe < 20 and mom_12_1 > 10 and sector == "Energy"`, presets |
+| | `MAP` | Treemap heatmap by sector (1D / 1M / YTD / momentum), breadth |
+| | `EVT` | Calendar: watchlist earnings + FOMC, CPI, payrolls, PCE, GDP |
+| | `AAPL ERN` | Earnings: options-implied move vs past reactions, EPS surprises |
+| | `NVDA FF` | Factor exposure (market, size, value, momentum, quality, low vol) with attribution; portfolios too |
+| | `NOTE` | Research notes, per ticker, auto-saved |
+| | `ASK question` | AI assistant that pulls terminal data, answers, and opens the right panels |
 
 ### Backtest formula language
 
@@ -109,10 +135,6 @@ Run the tests with `pip install pytest && pytest -q`.
 
 ## Roadmap
 
-- Real broker connectivity (Interactive Brokers / Alpaca) behind the paper-broker interface
-- Real-time intraday streaming quotes, alerts and price triggers
-- Factor models (Fama-French), earnings/event calendar, screener (`EQS`)
-- Walk-forward / out-of-sample backtest validation, multi-asset strategy backtests
-- Saved workspaces and a notebook-style research panel
+See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the researched list of next features.
 
 *Not investment advice. Free data sources can be delayed, incomplete or wrong. Check anything you trade on.*

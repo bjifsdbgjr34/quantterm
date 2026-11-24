@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import json
 import logging
 import math
@@ -24,6 +25,14 @@ from .analytics import portfolio as pf
 from .analytics import risk
 from .analytics import timeseries as ts
 from .data import providers as P
+from . import assistant
+from .analytics import factors as fx
+from .analytics import multiasset as ma
+from .analytics import optsignals as osig
+from .analytics import screener as scr
+from .analytics import walkforward as wf
+from .store import ALERT_KINDS, Store, alert_hit
+from .trading.broker import make_broker
 from .trading.paper import PaperBroker
 
 log = logging.getLogger("quantterm")
@@ -67,10 +76,16 @@ class CleanRoute(APIRoute):
     def __init__(self, path, endpoint, **kw):
         orig = endpoint
 
-        @functools.wraps(orig)
-        def wrapped(*a, **k):
-            res = orig(*a, **k)
-            return res if isinstance(res, Response) else SafeJSON(res)
+        if inspect.iscoroutinefunction(orig):
+            @functools.wraps(orig)
+            async def wrapped(*a, **k):
+                res = await orig(*a, **k)
+                return res if isinstance(res, Response) else SafeJSON(res)
+        else:
+            @functools.wraps(orig)
+            def wrapped(*a, **k):
+                res = orig(*a, **k)
+                return res if isinstance(res, Response) else SafeJSON(res)
 
         super().__init__(path, wrapped, **kw)
 
@@ -78,7 +93,13 @@ class CleanRoute(APIRoute):
 app = FastAPI(title="QuantTerm", default_response_class=SafeJSON)
 app.router.route_class = CleanRoute
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
-broker = PaperBroker()
+try:
+    broker = make_broker()
+    BROKER_ERROR = None
+except Exception as _e:  # noqa: BLE001  misconfigured real broker -> fall back to paper, tell the UI
+    log.error("broker init failed, using paper broker: %s", _e)
+    broker, BROKER_ERROR = PaperBroker(), str(_e)
+store = Store()
 
 
 @app.exception_handler(P.DataError)
@@ -89,6 +110,16 @@ async def _data_err(_: Request, exc: P.DataError):
 @app.exception_handler(bt.ExprError)
 async def _expr_err(_: Request, exc: bt.ExprError):
     return SafeJSON({"error": f"Expression error: {exc}"}, status_code=400)
+
+
+@app.exception_handler(scr.FilterError)
+async def _filter_err(_: Request, exc: scr.FilterError):
+    return SafeJSON({"error": f"Filter error: {exc}"}, status_code=400)
+
+
+@app.exception_handler(RuntimeError)
+async def _rt_err(_: Request, exc: RuntimeError):
+    return SafeJSON({"error": str(exc)}, status_code=502)
 
 
 @app.exception_handler(ValueError)
@@ -125,7 +156,9 @@ def favicon():
 @app.get("/api/status")
 def status():
     return {"mode": config.DATA_MODE, "yahoo": config.DATA_MODE != "demo" and P.online("yahoo"),
-            "fred": config.DATA_MODE != "demo" and P.online("fred"), "time": datetime.now().isoformat(timespec="seconds")}
+            "fred": config.DATA_MODE != "demo" and P.online("fred"), "time": datetime.now().isoformat(timespec="seconds"),
+            "broker": broker.name, "broker_live": broker.live, "broker_error": BROKER_ERROR,
+            "ai": assistant.ai_available()}
 
 
 @app.get("/api/search")
@@ -306,6 +339,13 @@ def expiries(symbol: str):
     return {"source": r.source, "expiries": r.data}
 
 
+def _future_expiries(exps: list[str]) -> list[str]:
+    """Drop expiries on/before today: 0DTE chains are thin, noisy and Yahoo often returns them empty."""
+    today = date.today().isoformat()
+    fut = [e for e in exps if e > today]
+    return fut or exps
+
+
 def _tau(expiry: str) -> float:
     return max((date.fromisoformat(expiry) - date.today()).days + 0.7, 0.5) / 365.0
 
@@ -314,7 +354,8 @@ def _tau(expiry: str) -> float:
 def chain(symbol: str, expiry: str | None = None, rate: float | None = None):
     sym = P.norm(symbol)
     exps = P.option_expiries(sym).data
-    expiry = expiry or exps[min(2, len(exps) - 1)]
+    fut = _future_expiries(exps)
+    expiry = expiry or fut[min(2, len(fut) - 1)]
     r = P.option_chain(sym, expiry)
     spot = _last_price(sym)
     rf = config.RISK_FREE if rate is None else rate
@@ -362,14 +403,18 @@ def chain(symbol: str, expiry: str | None = None, rate: float | None = None):
 @app.get("/api/volsurface/{symbol}")
 def volsurface(symbol: str, n: int = 8):
     sym = P.norm(symbol)
-    exps = P.option_expiries(sym).data
+    exps = _future_expiries(P.option_expiries(sym).data)
     spot = _last_price(sym)
     src = "yahoo"
     # pick a spread of expiries rather than only the front weeklies
     picks = exps if len(exps) <= n else [exps[int(i)] for i in np.linspace(0, len(exps) - 1, n)]
     smiles = []
     for e in picks:
-        r = P.option_chain(sym, e)
+        try:
+            r = P.option_chain(sym, e)
+        except P.DataError as ex:  # one bad expiry (Yahoo hiccup) shouldn't kill the surface
+            log.warning("volsurface %s %s skipped: %s", sym, e, ex)
+            continue
         src = r.source
         T = _tau(e)
         pts = []
@@ -558,7 +603,7 @@ def _paper_prices(extra: list[str] | None = None) -> dict[str, float]:
 def paper():
     prices = _paper_prices()
     broker.process_open_orders(prices)
-    return broker.snapshot(prices)
+    return broker.snapshot(prices) | {"broker": broker.name, "live": broker.live, "broker_error": BROKER_ERROR}
 
 
 @app.post("/api/paper/order")
@@ -572,8 +617,8 @@ def paper_order(body: dict = Body(...)):
 
 
 @app.delete("/api/paper/order/{oid}")
-def paper_cancel(oid: int):
-    broker.cancel(oid)
+def paper_cancel(oid: str):
+    broker.cancel(int(oid) if oid.isdigit() else oid)
     return {"ok": True}
 
 
@@ -688,3 +733,501 @@ def pca_ep(symbols: str, period: str = "2y", k: int = 5):
     rets = r.data.ffill().dropna().pct_change().dropna()
     res = qt.pca(rets, k)
     return {"source": r.source, **res, "dates": _dates(res["dates"])}
+
+
+# ------------------------------------------------------------------------------------ walk-forward / multi-asset
+@app.post("/api/walkforward")
+def walkforward(body: dict = Body(...)):
+    sym = P.norm(body.get("symbol", "SPY"))
+    r = P.history(sym, body.get("period", "max"))
+    res = wf.walk_forward(r.data, body.get("strategy", "sma_cross"), body.get("grid"),
+                          int(body.get("train_days", 756)), int(body.get("test_days", 126)),
+                          float(body.get("cost_bps", 5)), body.get("metric", "Sharpe"),
+                          bool(body.get("anchored", False)), config.RISK_FREE)
+    eq, b, ins = res.pop("equity"), res.pop("benchmark"), res.pop("in_sample_equity")
+    return {"source": r.source, "symbol": sym, **res, "dates": _dates(eq.index), "equity": eq,
+            "benchmark": b.reindex(eq.index), "in_sample_equity": ins.reindex(eq.index)}
+
+
+@app.get("/api/mbt/strategies")
+def mbt_strategies():
+    return {"strategies": ma.STRATEGIES, "rebalance": list(ma.REBAL)}
+
+
+@app.post("/api/mbt")
+def mbt(body: dict = Body(...)):
+    syms = _syms(body.get("symbols", "SPY,EFA,EEM,TLT,GLD,DBC,VNQ"))
+    if len(syms) < 2:
+        raise HTTPException(400, "need at least 2 symbols")
+    r = P.closes(tuple(syms), body.get("period", "10y"))
+    bench_sym = body.get("bench")
+    bench = None
+    if bench_sym:
+        bs = P.norm(bench_sym)
+        bench = P.closes((bs,), body.get("period", "10y")).data.iloc[:, 0].rename(bs)
+    res = ma.run(r.data, body.get("strategy", "xs_momentum"), int(body.get("top_n", 3)), int(body.get("lookback", 126)),
+                 int(body.get("skip", 21)), body.get("rebalance", "monthly"), float(body.get("cost_bps", 5)),
+                 config.RISK_FREE, bench)
+    eq, bn, w = res.pop("equity"), res.pop("benchmark"), res.pop("weights")
+    return {"source": r.source, "symbols": list(r.data.columns), **res, "dates": _dates(eq.index), "equity": eq,
+            "benchmark": bn, "drawdown": ts.drawdown(eq) * 100,
+            "weights": {c: w[c] for c in w.columns}}
+
+
+# ------------------------------------------------------------------------------------ factor model
+@app.get("/api/factors")
+def factors(symbols: str, weights: str = "", period: str = "3y", window: int = 126):
+    syms = _syms(symbols)
+    need = tuple(sorted(set(syms) | fx.FACTOR_ETFS))
+    r = P.closes(need, period)
+    px = r.data.ffill().dropna(how="all")
+    if weights:
+        w = pd.Series([float(x) for x in weights.split(",")], index=syms[: len(weights.split(","))])
+    else:
+        w = pd.Series(1 / len(syms), index=syms)
+    w = w / w.sum()
+    rets = px[w.index].pct_change()
+    asset = (rets * w).sum(axis=1, min_count=len(w))
+    fac = fx.factor_returns(px, config.RISK_FREE)
+    res = fx.factor_model(asset, fac, config.RISK_FREE, window)
+    att, rol = res.pop("attribution"), res.pop("rolling")
+    label = syms[0] if len(syms) == 1 else "Portfolio (" + ", ".join(f"{s} {v:.0%}" for s, v in w.items()) + ")"
+    return {"source": r.source, "label": label, "symbols": syms, "weights": w.to_dict(), **res,
+            "attribution": {"dates": _dates(att["dates"]), "series": att["series"]},
+            "rolling": {"dates": _dates(rol["dates"]), "series": rol["series"]} if rol else None,
+            "factor_desc": fx.FACTOR_DESC}
+
+
+# ------------------------------------------------------------------------------------ screener & heatmap
+def _universe_frame(name: str) -> tuple[pd.DataFrame, str]:
+    syms = tuple(P.universe(name))
+    r = P.closes(syms + ("^GSPC",), "2y")
+    px = r.data.ffill()
+    tech = scr.technicals(px.drop(columns=["^GSPC"], errors="ignore"), px.get("^GSPC"))
+    inf = P.bulk_info(syms)
+    fund = pd.DataFrame({s: scr.fundamentals_row(d) for s, d in inf.data.items()}).T
+    df = tech.join(fund, how="left")
+    df["sector"] = df["sector"].fillna(pd.Series(P.UNIVERSE_SECTOR)).fillna("Other")
+    src = "demo" if "demo" in (r.source, inf.source) else r.source
+    return df, src
+
+
+@app.post("/api/screener")
+def screener(body: dict = Body(default={})):
+    df, src = _universe_frame(body.get("universe", "SPX100"))
+    mask = scr.apply_filter(df, body.get("filter", ""))
+    out = df[mask].copy()
+    sort = body.get("sort", "mom_12_1")
+    if sort in out:
+        out = out.sort_values(sort, ascending=bool(body.get("ascending", False)), na_position="last")
+    out = out.reset_index(names="symbol")
+    return {"source": src, "count": int(mask.sum()), "total": len(df), "rows": out.to_dict(orient="records"),
+            "fields": scr.METRICS, "presets": scr.PRESETS}
+
+
+@app.get("/api/heatmap")
+def heatmap(universe: str = "SPX100", metric: str = "chg_1d"):
+    df, src = _universe_frame(universe)
+    if metric not in df:
+        raise HTTPException(400, f"metric must be one of {', '.join(c for c in df.columns if c not in ('name', 'sector'))}")
+    rows = [{"symbol": s, "sector": r["sector"], "name": r.get("name"), "value": r[metric],
+             "mcap_b": r.get("mcap_b"), "last": r["last"]} for s, r in df.iterrows()]
+    sectors = df.groupby("sector")[metric].mean().sort_values(ascending=False)
+    return {"source": src, "metric": metric, "rows": rows, "sectors": sectors.to_dict(),
+            "breadth": {"up": int((df["chg_1d"] > 0).sum()), "down": int((df["chg_1d"] < 0).sum()),
+                        "above_200": float(df["above_200"].mean() * 100)}}
+
+
+# ------------------------------------------------------------------------------------ intraday & streaming
+@app.get("/api/intraday/{symbol}")
+def intraday(symbol: str, interval: str = "5m", days: int = 1):
+    r = P.intraday(symbol, interval, days)
+    df = r.data
+    prev = P.history(symbol, "5d").data["Close"]
+    prev_close = float(prev.iloc[-2]) if len(prev) > 1 else float(df["Open"].iloc[0])
+    vwap = (df["Close"] * df["Volume"]).cumsum() / df["Volume"].cumsum().replace(0, np.nan)
+    return {"source": r.source, "symbol": P.norm(symbol), "interval": interval,
+            "times": [t.strftime("%Y-%m-%d %H:%M") for t in df.index], "open": df["Open"], "high": df["High"],
+            "low": df["Low"], "close": df["Close"], "volume": df["Volume"], "vwap": vwap, "prev_close": prev_close,
+            "last": float(df["Close"].iloc[-1]), "pct": (float(df["Close"].iloc[-1]) / prev_close - 1) * 100}
+
+
+@app.get("/api/live")
+def live(symbols: str):
+    r = P.live_quotes(tuple(_syms(symbols)))
+    return {"source": r.source, "quotes": r.data}
+
+
+@app.get("/api/stream")
+async def stream(symbols: str, interval: float = 5.0):
+    """Server-sent events: a quote snapshot every ``interval`` seconds (min 2s) until the client disconnects."""
+    import asyncio
+
+    from fastapi.responses import StreamingResponse
+    from starlette.concurrency import run_in_threadpool
+
+    syms = tuple(_syms(symbols))[:40]
+    interval = max(2.0, float(interval))
+
+    async def gen():
+        while True:
+            try:
+                r = await run_in_threadpool(P.live_quotes, syms)
+                yield f"data: {json.dumps(clean({'source': r.source, 'quotes': r.data}))}\n\n"
+            except Exception as e:  # noqa: BLE001
+                yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+            await asyncio.sleep(interval)
+
+    return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+
+
+# ------------------------------------------------------------------------------------ alerts
+@app.get("/api/alerts")
+def alerts_list():
+    return {"alerts": store.alerts(), "kinds": ALERT_KINDS}
+
+
+@app.post("/api/alerts")
+def alerts_add(body: dict = Body(...)):
+    return {"alert": store.add_alert(P.norm(body["symbol"]), body.get("kind", "above"), float(body["level"]),
+                                     body.get("note", ""), bool(body.get("repeat", False)))}
+
+
+@app.delete("/api/alerts/{aid}")
+def alerts_delete(aid: int):
+    store.delete_alert(aid)
+    return {"ok": True}
+
+
+@app.get("/api/alerts/check")
+def alerts_check():
+    """Evaluate active alerts against current prices. The UI polls this and raises notifications."""
+    active = store.alerts(active_only=True)
+    if not active:
+        return {"fired": [], "source": None}
+    syms = tuple(sorted({a["symbol"] for a in active}))
+    q = P.live_quotes(syms)
+    last = {x["symbol"]: x for x in q.data}
+    rv: dict[str, float | None] = {}
+    fired = []
+    for a in active:
+        s = a["symbol"]
+        if a["kind"] == "vol" and s not in rv:
+            try:
+                rv[s] = float(ts.volatility(P.history(s, "3mo").data["Close"], 10).iloc[-1])
+            except Exception:  # noqa: BLE001
+                rv[s] = None
+        x = last.get(s, {})
+        hit = alert_hit(a["kind"], a["level"], x.get("last"), x.get("pct"), rv.get(s))
+        if hit is not None:
+            store.mark_triggered(a["id"], hit, keep_active=bool(a["repeat"]))
+            fired.append(a | {"value": hit, "last": x.get("last")})
+    return {"fired": fired, "source": q.source, "checked": len(active)}
+
+
+# ------------------------------------------------------------------------------------ workspaces & notes
+@app.get("/api/workspaces")
+def ws_list():
+    return {"workspaces": store.workspaces()}
+
+
+@app.post("/api/workspaces")
+def ws_save(body: dict = Body(...)):
+    return store.save_workspace(body["name"], int(body.get("layout", 4)), list(body.get("panels", [])), body.get("links"))
+
+
+@app.delete("/api/workspaces/{name}")
+def ws_delete(name: str):
+    store.delete_workspace(name)
+    return {"ok": True}
+
+
+@app.get("/api/notes")
+def notes_list(symbol: str | None = None):
+    return {"notes": store.notes(P.norm(symbol) if symbol else None)}
+
+
+@app.post("/api/notes")
+def notes_save(body: dict = Body(...)):
+    return {"note": store.save_note(body.get("body", ""), body.get("title", ""),
+                                    P.norm(body["symbol"]) if body.get("symbol") else "", body.get("id"))}
+
+
+@app.delete("/api/notes/{nid}")
+def notes_delete(nid: int):
+    store.delete_note(nid)
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------------------------ export
+@app.post("/api/export/xlsx")
+def export_xlsx(body: dict = Body(...)):
+    """Turn panel tables (sent by the UI as lists of rows) into an Excel workbook."""
+    import io as _io
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    for i, sh in enumerate(body.get("sheets", [])[:20]):
+        ws = wb.create_sheet((sh.get("name") or f"Table {i + 1}")[:31].replace("/", "-"))
+        for j, row in enumerate(sh.get("rows", [])[:20000]):
+            ws.append([_cell(v) for v in row])
+            if j == 0:
+                for c in ws[1]:
+                    c.font = Font(bold=True, color="000000")
+                    c.fill = PatternFill("solid", fgColor="FB8B1E")
+    if not wb.sheetnames:
+        wb.create_sheet("Empty")
+    buf = _io.BytesIO()
+    wb.save(buf)
+    name = "".join(ch for ch in body.get("filename", "quantterm") if ch.isalnum() or ch in "-_ ")[:60] or "quantterm"
+    return Response(buf.getvalue(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f'attachment; filename="{name}.xlsx"'})
+
+
+def _cell(v):
+    if isinstance(v, str):
+        t = v.replace(",", "").replace("%", "").replace("$", "").strip()
+        if t.startswith("+"):
+            t = t[1:]
+        try:
+            return float(t) if t and t not in ("—", "-") else (None if t in ("—",) else v)
+        except ValueError:
+            return v
+    return v
+
+
+# ------------------------------------------------------------------------------------ events & earnings
+@app.get("/api/events")
+def events(symbols: str = "", days: int = 45):
+    syms = _syms(symbols) if symbols.strip() else []
+    rows, src = [], "static"
+    today = date.today().isoformat()
+    for s in syms[:40]:
+        try:
+            r = P.earnings_date(s)
+        except P.DataError:
+            continue
+        src = "demo" if r.source == "demo" else (src if src == "demo" else r.source)
+        nxt = [x for x in r.data if x["date"] >= today]
+        if nxt and nxt[0]["date"] <= (date.today() + pd.Timedelta(days=days)).isoformat():
+            rows.append({"date": nxt[0]["date"], "event": f"{s} earnings", "kind": "earnings", "symbol": s,
+                         "eps_est": nxt[0].get("eps_est"), "estimated": False})
+    rows += P.macro_calendar(days)
+    rows.sort(key=lambda x: x["date"])
+    return {"source": src, "events": rows}
+
+
+@app.get("/api/earnings/{symbol}")
+def earnings(symbol: str):
+    sym = P.norm(symbol)
+    r = P.earnings_date(sym)
+    today = date.today().isoformat()
+    past = [x for x in r.data if x["date"] < today]
+    nxt = next((x for x in r.data if x["date"] >= today), None)
+    px = P.history(sym, "5y").data["Close"]
+    moves = []
+    for x in past:
+        d = pd.Timestamp(x["date"])
+        before, after = px[px.index < d], px[px.index > d]
+        if len(before) and len(after):
+            moves.append(x | {"move_pct": (float(after.iloc[0]) / float(before.iloc[-1]) - 1) * 100})
+    implied = None
+    if nxt:
+        try:
+            exps = P.option_expiries(sym).data
+            exp = next((e for e in exps if e >= nxt["date"]), None)
+            if exp:
+                c = chain(sym, exp)
+                implied = {"expiry": exp, "move_pct": c["summary"]["implied_move_pct"], "atm_iv": c["summary"]["atm_iv"],
+                           "straddle": c["summary"]["straddle"], "spot": c["spot"]}
+        except Exception as e:  # noqa: BLE001
+            implied = {"error": str(e)}
+    abs_moves = [abs(m["move_pct"]) for m in moves]
+    return {"source": r.source, "symbol": sym, "next": nxt, "history": moves, "implied": implied,
+            "avg_abs_move": float(np.mean(abs_moves)) if abs_moves else None,
+            "max_abs_move": float(np.max(abs_moves)) if abs_moves else None,
+            "beat_rate": float(np.mean([m["eps_act"] > m["eps_est"] for m in moves if m.get("eps_act") is not None
+                                        and m.get("eps_est") is not None]) * 100) if any(m.get("eps_act") is not None for m in moves) else None}
+
+
+# ------------------------------------------------------------------------------------ options: skew & scanner
+@app.get("/api/skew/{symbol}")
+def skew(symbol: str, n: int = 8):
+    sym = P.norm(symbol)
+    exps = _future_expiries(P.option_expiries(sym).data)
+    picks = exps if len(exps) <= n else [exps[int(i)] for i in np.linspace(0, len(exps) - 1, n)]
+    rows, src = [], "yahoo"
+    for e in picks:
+        try:
+            c = chain(sym, e)
+        except P.DataError as ex:
+            log.warning("skew %s %s skipped: %s", sym, e, ex)
+            continue
+        src = c["source"]
+        m = osig.skew_metrics(c["spot"], c["T"], c["rate"], c["calls"], c["puts"])
+        rows.append({"expiry": e, "days": int(round(c["T"] * 365)), **m,
+                     "implied_move_pct": c["summary"]["implied_move_pct"], "pc_oi": c["summary"]["pc_oi"]})
+    if not rows:
+        raise P.DataError(f"no usable option chains for {sym}")
+    rv = P.history(sym, "1y").data["Close"]
+    rv30 = float(ts.volatility(rv, 21).iloc[-1]) / 100
+    ts_ = osig.term_structure(rows)
+    front = rows[0] if rows else {}
+    vrp = (front.get("atm_iv") - rv30) if front.get("atm_iv") else None
+    return {"source": src, "symbol": sym, "expiries": rows, "term": ts_, "rv30": rv30, "vrp": vrp,
+            "signals": _skew_signals(rows, ts_, vrp)}
+
+
+def _skew_signals(rows, term, vrp) -> list[str]:
+    out = []
+    if vrp is not None:
+        out.append(f"Front IV is {abs(vrp) * 100:.1f} vol pts {'above' if vrp > 0 else 'below'} 30d realized: "
+                   + ("options look rich vs recent movement (premium sellers' environment)." if vrp > 0.02 else
+                      "options look cheap vs recent movement (premium buyers' environment)." if vrp < -0.02 else "roughly fair."))
+    if term:
+        out.append(f"Term structure is in {term['state']}.")
+    rr = [r.get("rr25") for r in rows if r.get("rr25") is not None]
+    if rr:
+        out.append(f"Front 25Δ risk reversal {rr[0] * 100:+.1f} vol pts: "
+                   + ("downside puts carry a strong premium (crash protection bid)." if rr[0] < -0.05 else
+                      "calls are bid over puts (upside chase / squeeze risk)." if rr[0] > 0.01 else "typical equity skew."))
+    return out
+
+
+@app.post("/api/optscan")
+def optscan(body: dict = Body(...)):
+    sym = P.norm(body.get("symbol", "SPY"))
+    c = chain(sym, body.get("expiry")) if body.get("expiry") else chain(sym)
+    px = P.history(sym, "1y").data["Close"]
+    rv = float(ts.volatility(px, int(body.get("rv_window", 21))).iloc[-1]) / 100
+    sigma = float(body["vol"]) / 100 if body.get("vol") else rv
+    res = osig.scan(c["spot"], c["T"], c["rate"], c["calls"], c["puts"], sigma, float(body.get("width_pct", 5)) / 100)
+    return {"source": c["source"], "symbol": sym, "spot": c["spot"], "expiry": c["expiry"], "expiries": c["expiries"],
+            "days": int(round(c["T"] * 365)), "forecast_vol": sigma, "rv": rv, "atm_iv": c["summary"]["atm_iv"],
+            "strategies": res}
+
+
+# ------------------------------------------------------------------------------------ morning briefing
+@app.get("/api/brief")
+def brief(watch: str = ""):
+    out: dict = {"source": "yahoo", "asof": datetime.now().isoformat(timespec="minutes")}
+    movers = []
+    for g in ("WEI", "FX", "CMDT", "CRYPTO", "RATES"):
+        r = P.quotes(tuple(P.MONITORS[g]))
+        out["source"] = "demo" if r.source == "demo" else out["source"]
+        out[g] = [q for q in r.data if q.get("last") is not None]
+        movers += [q | {"group": g} for q in out[g]]
+    out["biggest"] = sorted(movers, key=lambda q: -abs(q.get("pct") or 0))[:6]
+    if watch.strip():
+        out["watch"] = P.quotes(tuple(_syms(watch))).data
+    out["events"] = events(watch, 7)["events"]
+    try:
+        vix = P.history("^VIX", "1y").data["Close"]
+        out["vix"] = {"last": float(vix.iloc[-1]), "pctile_1y": float((vix < vix.iloc[-1]).mean() * 100),
+                      "chg_5d": float(vix.iloc[-1] - vix.iloc[-6])}
+    except Exception:  # noqa: BLE001
+        out["vix"] = None
+    try:
+        cur = P.yield_curve().data
+        t = cur["tenors"]
+        c = cur["curves"]["Current"]
+        out["curve"] = {"2Y": c[t.index("2Y")], "10Y": c[t.index("10Y")], "2s10s_bp": (c[t.index("10Y")] - c[t.index("2Y")]) * 100}
+    except Exception:  # noqa: BLE001
+        out["curve"] = None
+    # portfolio risk from the active broker
+    try:
+        snap = paper()
+        pos = [p for p in snap["positions"] if p["qty"]]
+        risk_ = None
+        if pos:
+            syms = tuple(p["symbol"] for p in pos)
+            px = P.closes(syms, "1y").data.ffill().dropna()
+            rets = px.pct_change().dropna()
+            mv = pd.Series({p["symbol"]: p["mkt_value"] for p in pos}).reindex(rets.columns).fillna(0)
+            pnl = rets @ mv
+            risk_ = {"var95_1d": float(-np.percentile(pnl, 5)), "var99_1d": float(-np.percentile(pnl, 1)),
+                     "worst_day": float(pnl.min()), "n_positions": len(pos)}
+        out["portfolio"] = {"equity": snap["equity"], "pnl_total": snap["pnl_total"], "pnl_pct": snap["pnl_pct"],
+                            "gross": snap["gross_exposure"], "net": snap["net_exposure"], "risk": risk_,
+                            "top": sorted(pos, key=lambda p: -abs(p["mkt_value"]))[:5], "broker": broker.name}
+    except Exception as e:  # noqa: BLE001
+        out["portfolio"] = {"error": str(e)}
+    out["alerts"] = [a for a in store.alerts() if a["triggered"]][:8]
+    return out
+
+
+# ------------------------------------------------------------------------------------ AI assistant
+def _ai_handlers() -> dict:
+    def quotes_h(a):
+        r = P.quotes(tuple(_syms(",".join(a["symbols"][:20]))))
+        return clean({"source": r.source, "quotes": [{k: q.get(k) for k in ("symbol", "name", "last", "pct", "wtd", "ytd", "time")}
+                                                     for q in r.data]})
+
+    def risk_h(a):
+        d = des(a["symbol"])
+        return clean({"source": d["source"], "symbol": d["symbol"], "name": d["info"].get("longName"),
+                      "quote": {k: d["quote"].get(k) for k in ("last", "pct", "ytd")}, "stats_1y": d["stats_1y"],
+                      "realized_vol_pct": d["realized_vol"], "range_52w": d["range_52w"]})
+
+    def vol_h(a):
+        v = vol(a["symbol"], "2y")
+        g = garch(a["symbol"], "5y", 21)
+        out = {"source": v["source"], "symbol": v["symbol"],
+               "realized_vol_now_pct": {k: (s.dropna().iloc[-1] if len(s.dropna()) else None) for k, s in v["series"].items()},
+               "realized_vol_1m_ago_pct": {k: (s.dropna().iloc[-22] if len(s.dropna()) > 22 else None) for k, s in v["series"].items()},
+               "vol_cone": v["cone"], "garch": {k: g[k] for k in ("current_vol", "long_run_vol", "persistence", "half_life_days")}}
+        try:
+            vx = P.history("^VIX", "3mo").data["Close"]
+            out["vix"] = {"last": vx.iloc[-1], "1m_ago": vx.iloc[-22]}
+        except Exception:  # noqa: BLE001
+            pass
+        return clean(out)
+
+    def opt_h(a):
+        c = chain(a["symbol"])
+        sk = skew(a["symbol"], 6)
+        return clean({"source": c["source"], "symbol": c["symbol"], "spot": c["spot"], "front_expiry": c["expiry"],
+                      "summary": c["summary"], "skew_by_expiry": sk["expiries"], "term_structure": sk["term"],
+                      "rv30": sk["rv30"], "signals": sk["signals"]})
+
+    def macro_h(a):
+        out, src = {}, "fred"
+        for sid in a["series"][:10]:
+            e = eco(sid, (date.today() - pd.Timedelta(days=800)).isoformat())
+            src = e["source"] if e["source"] == "demo" else src
+            s = e["series"][sid.upper()]
+            vals, dts = s["values"], s["dates"]
+            ser = pd.Series(vals, index=pd.to_datetime(dts))
+            last_dt = ser.index[-1]
+
+            def ago(days, ser=ser, last_dt=last_dt):
+                sub = ser[ser.index <= last_dt - pd.Timedelta(days=days)]
+                return float(sub.iloc[-1]) if len(sub) else None
+
+            out[sid.upper()] = {"name": s["name"], "last": s["last"], "date": s["last_date"], "1m_ago": ago(30), "1y_ago": ago(365)}
+        return clean({"source": src, "series": out})
+
+    def news_h(a):
+        r = P.news(P.norm(a["symbol"]))
+        return clean({"source": r.source, "items": [{k: n.get(k) for k in ("title", "publisher", "time")} for n in r.data[:10]]})
+
+    def fac_h(a):
+        f = factors(a["symbol"], "", "2y")
+        return clean({"source": f["source"], "symbol": a["symbol"], "r2": f["r2"], "alpha_ann": f["alpha_ann"],
+                      "loadings": f["loadings"], "variance_share": f["variance_share"]})
+
+    return {"get_quotes": quotes_h, "get_risk_profile": risk_h, "get_volatility": vol_h, "get_options": opt_h,
+            "get_macro": macro_h, "get_news": news_h, "get_factor_exposure": fac_h}
+
+
+@app.post("/api/ask")
+def ask(body: dict = Body(...)):
+    return assistant.ask(body.get("question", ""), _ai_handlers(), body.get("context"))
+
+
+@app.get("/api/broker")
+def broker_info():
+    return {"name": broker.name, "live": broker.live, "error": BROKER_ERROR}
