@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QuantTerm</title>
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/vendor/plotly.min.js"></script>
+</head>
+<body>
+<header id="top">
+  <div id="brand">QUANT<span>TERM</span></div>
+  <div id="cmdwrap">
+    <span id="cmdprompt">&gt;</span>
+    <input id="cmd" autocomplete="off" spellcheck="false" placeholder="Type a command, e.g.  AAPL GP   ·   MC SPY   ·   PORT SPY TLT GLD   ·   HELP   — then Enter">
+    <div id="suggest" class="hidden"></div>
+  </div>
+  <div id="layouts" title="Panel layout">
+    <button data-layout="1">1</button><button data-layout="2">2</button><button data-layout="3">3</button><button data-layout="4">4</button><button data-layout="6">6</button>
+  </div>
+  <div id="clocks"></div>
+</header>
+<div id="tape"><div id="tapeinner"></div></div>
+<main id="grid"></main>
+<footer id="status">
+  <span id="st-mode"></span>
+  <span id="st-src"></span>
+  <span class="hint">Click a panel to focus it · Enter runs in focused panel · Shift+Enter opens in next panel · ↑/↓ history · Ctrl+1..6 select panel · F1 help · Esc clear</span>
+  <span id="st-time"></span>
+</footer>
+<script src="/static/app.js"></script>
+<script src="/static/quant.js"></script>
+</body>
+</html>
